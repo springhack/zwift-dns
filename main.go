@@ -53,6 +53,7 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 
 			if q.Qtype == dns.TypeA {
 				rr, _ := dns.NewRR(fmt.Sprintf("%s A %s", q.Name, ip))
+				rr.Header().Ttl = 300
 				msg.Answer = append(msg.Answer, rr)
 			}
 		} else {
