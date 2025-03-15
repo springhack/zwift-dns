@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"net"
+	"slices"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -14,77 +16,84 @@ import (
 )
 
 const (
-	forwardDNS    = "10.10.10.1:53"
-	mdnsDomain    = "zwift.local"
-	localhostAddr = "127.0.0.1"
+	mdnsDomain        = "zwift.local"
+	upstreamDnsServer = "10.10.10.1:53"
 )
 
 var (
-	zwiftServerAddr = localhostAddr
-	zwiftFakeDomain = []string{
-		"us-or-rly101.zwift.com",
-		"secure.zwift.com",
-		"cdn.zwift.com",
-		"launcher.zwift.com",
+	mu            sync.RWMutex
+	currentIP     = net.ParseIP("127.0.0.1")
+	targetDomains = []string{
+		"us-or-rly101.zwift.com.",
+		"secure.zwift.com.",
+		"cdn.zwift.com.",
+		"launcher.zwift.com.",
 	}
 )
 
 func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
-	msg := dns.Msg{}
-	msg.SetReply(r)
-	msg.Authoritative = true
+	var finalQuestion []dns.Question
+	var finalAnswer []dns.RR
 
-	for _, q := range r.Question {
-		queryDomainName := q.Name[:len(q.Name)-1]
-		isZwiftFakeDomain := false
-		for _, domain := range zwiftFakeDomain {
-			if domain == queryDomainName {
-				isZwiftFakeDomain = true
-				log.Println("zwift query", q.String())
-			}
-		}
-		if isZwiftFakeDomain {
-			ip, err := resolveMDNS(mdnsDomain)
-			if err != nil {
-				log.Printf("mDNS 解析失败: %v", err)
-				dns.HandleFailed(w, r)
-				return
-			}
+	finalResponse := &dns.Msg{}
+	finalResponse.SetReply(r)
+	finalResponse.Authoritative = true
+	finalResponse.Question = r.Question[:]
 
-			if q.Qtype == dns.TypeA {
-				rr, _ := dns.NewRR(fmt.Sprintf("%s A %s", q.Name, ip))
+	for _, question := range r.Question {
+		switch question.Qtype {
+		case dns.TypeA:
+			if slices.Contains(targetDomains, strings.ToLower(question.Name)) && currentIP != nil {
+				mu.Lock()
+				// fake a type a answer
+				rr, _ := dns.NewRR(fmt.Sprintf("%s A %s", question.Name, currentIP))
+				mu.Unlock()
 				rr.Header().Ttl = 300
-				msg.Answer = append(msg.Answer, rr)
+				finalAnswer = append(finalAnswer, rr)
+			} else {
+				// forward to upstream if not match
+				finalQuestion = append(finalQuestion, question)
 			}
-		} else {
-			resp, err := forwardQuery(r)
-			if err != nil {
-				log.Printf("DNS 透传失败: %v", err)
-				dns.HandleFailed(w, r)
-				return
+		case dns.TypeAAAA:
+			if !slices.Contains(targetDomains, strings.ToLower(question.Name)) {
+				// forward type aaaa question if not match
+				finalQuestion = append(finalQuestion, question)
 			}
-			w.WriteMsg(resp)
-			return
+			continue
+		default:
+			// forward to upstream
+			finalQuestion = append(finalQuestion, question)
 		}
 	}
 
-	w.WriteMsg(&msg)
-}
-
-func forwardQuery(req *dns.Msg) (*dns.Msg, error) {
-	client := new(dns.Client)
-	resp, _, err := client.Exchange(req, forwardDNS)
-	return resp, err
-}
-
-func resolveMDNS(hostname string) (string, error) {
-	if zwiftServerAddr == localhostAddr {
-		return "", errors.ErrUnsupported
+	log.Println("Q:", finalQuestion, finalAnswer)
+	// forward other questions and combine it's answers into finalAnswer
+	if len(finalQuestion) != 0 {
+		r.Question = finalQuestion
+		response := forwardRequest(r)
+		if response != nil {
+			finalAnswer = append(finalAnswer, response.Answer...)
+			log.Println("O:", response.Answer)
+		}
 	}
-	return zwiftServerAddr, nil
+
+	log.Println("F:", finalAnswer)
+	// write response
+	finalResponse.Answer = append(finalResponse.Answer, finalAnswer...)
+	w.WriteMsg(finalResponse)
 }
 
-func doMDNSResolve() {
+func forwardRequest(r *dns.Msg) *dns.Msg {
+	client := new(dns.Client)
+	resp, _, err := client.Exchange(r, upstreamDnsServer)
+	if err != nil {
+		log.Printf("Failed to forward DNS request: %v", err)
+		return nil
+	}
+	return resp
+}
+
+func updateMDNSRecords() {
 	addr4, err := net.ResolveUDPAddr("udp4", mdns.DefaultAddressIPv4)
 	if err != nil {
 		panic(err)
@@ -104,21 +113,25 @@ func doMDNSResolve() {
 	for {
 		answer, src, err := server.QueryAddr(context.TODO(), mdnsDomain)
 		if err == nil {
-			zwiftServerAddr = src.String()
+			srcSlice := src.As4()
+			mu.Lock()
+			currentIP = net.IP(srcSlice[:])
+			mu.Unlock()
 		} else {
-			log.Println(src, answer, err)
+			log.Println("Find mdns ip faied:", src, answer, err)
 		}
 		time.Sleep(time.Second * 5)
 	}
 }
 
 func main() {
-	server := &dns.Server{Addr: ":53", Net: "udp"}
-	dns.HandleFunc(".", handleDNSRequest)
-	go doMDNSResolve()
+	go updateMDNSRecords()
 
-	fmt.Println("DNS 服务器运行在 53 端口...")
+	dns.HandleFunc(".", handleDNSRequest)
+	server := &dns.Server{Addr: ":53", Net: "udp"}
+
+	log.Println("Starting DNS server on :53")
 	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("DNS 服务器启动失败: %v", err)
+		log.Fatalf("Failed to start DNS server: %v", err)
 	}
 }
